@@ -102,6 +102,36 @@ export default function Home() {
         reconnect({ connectors });
     }, [reconnect, connectors]);
 
+    // Request persistent storage for PWA - prevents browser from evicting app data
+    // This is important for wallet sessions, messages, and other cached data
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+        
+        const requestPersistentStorage = async () => {
+            if (navigator.storage && navigator.storage.persist) {
+                try {
+                    const isPersisted = await navigator.storage.persisted();
+                    if (isPersisted) {
+                        console.log("[PWA] Storage is already persistent");
+                        return;
+                    }
+                    
+                    const granted = await navigator.storage.persist();
+                    if (granted) {
+                        console.log("[PWA] Persistent storage granted - data will not be evicted");
+                    } else {
+                        console.log("[PWA] Persistent storage denied - data may be evicted by browser");
+                    }
+                } catch (err) {
+                    console.warn("[PWA] Could not request persistent storage:", err);
+                }
+            }
+        };
+        
+        // Request persistent storage (browsers may auto-grant for installed PWAs)
+        requestPersistentStorage();
+    }, []);
+    
     // PWA Wallet Reconnection Strategy:
     // - If user intentionally disconnected -> don't reconnect
     // - If user has NEVER connected wallet -> don't reconnect (show auth options)
@@ -229,6 +259,10 @@ export default function Home() {
     // Track failed sign-in attempts per wallet to prevent infinite loops
     const failedSignInAttempts = useRef<Map<string, number>>(new Map());
     const hasAutoSignInFailed = useRef<boolean>(false);
+    
+    // Server-side session - source of truth after updates/refreshes
+    const [serverAuthMethod, setServerAuthMethod] = useState<string | null>(null);
+    const [serverUserAddress, setServerUserAddress] = useState<string | null>(null);
 
     // Handle hydration
     useEffect(() => {
@@ -236,6 +270,33 @@ export default function Home() {
         // Check for saved session on mount
         hasSavedSession.current = hasSavedWalletSession();
     }, []);
+    
+    // Fetch session from server on mount
+    // This ensures correct auth type detection after app updates
+    useEffect(() => {
+        if (!mounted) return;
+        
+        const fetchServerSession = async () => {
+            try {
+                const res = await fetch("/api/auth/session", {
+                    method: "GET",
+                    credentials: "include",
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.authenticated && data.session) {
+                        console.log("[Auth] Server session:", data.session.authMethod, data.session.userAddress?.slice(0, 10));
+                        setServerAuthMethod(data.session.authMethod);
+                        setServerUserAddress(data.session.userAddress);
+                    }
+                }
+            } catch (error) {
+                console.error("[Auth] Failed to fetch server session:", error);
+            }
+        };
+        
+        fetchServerSession();
+    }, [mounted]);
 
     // Safety timeout - if stuck loading for too long, show recovery option
     useEffect(() => {
@@ -333,15 +394,17 @@ export default function Home() {
     }, [mounted, initializing, isWalletConnected, walletAddress, isSiweAuthenticated, isSiweLoading, signingIn, siweSignIn, walletType]);
 
     // Determine the active user address (supports both EVM and Solana)
-    // Can come from email auth, passkey, Alien identity, World ID, connected wallet, or authenticated SIWE user
+    // Can come from email auth, passkey, Alien identity, World ID, connected wallet, authenticated SIWE user, or server session
     // Note: alienAddress should be consistent (user_id from Alien SDK), not session-based
+    // serverUserAddress is used as fallback for users who have a valid server session but client providers haven't reconnected yet
     const userAddress: string | null = mounted
-        ? emailAddress || passkeyAddress || alienAddress || worldIdAddress || walletAddress || siweUser?.walletAddress || null
+        ? emailAddress || passkeyAddress || alienAddress || worldIdAddress || walletAddress || siweUser?.walletAddress || serverUserAddress || null
         : null;
 
     // Determine wallet type for dashboard
     // Use connected wallet type, or infer from SIWE user address format
     // Email, passkey, Alien, and World ID users use EVM (derived addresses)
+    // For server session fallback, infer from address format or authMethod
     const activeWalletType: WalletType = isEmailAuthenticated
         ? "evm" // Email users always use EVM (derived addresses)
         : isPasskeyAuthenticated
@@ -350,16 +413,21 @@ export default function Home() {
         ? "evm" // Alien users use EVM (identity addresses)
         : isWorldIdAuthenticated
         ? "evm" // World ID users use EVM (nullifier hash as address)
-        : walletType || (siweUser?.walletAddress?.startsWith("0x") ? "evm" : siweUser?.walletAddress ? "solana" : null);
+        : walletType 
+        || (siweUser?.walletAddress?.startsWith("0x") ? "evm" : siweUser?.walletAddress ? "solana" : null)
+        || (serverAuthMethod === "passkey" || serverAuthMethod === "email" ? "evm" : null)
+        || (serverUserAddress?.startsWith("0x") ? "evm" : serverUserAddress ? "solana" : null);
 
     // Require authentication for all users
-    // Email auth, passkey auth, Alien auth, World ID auth, or SIWE/SIWS authentication
+    // Email auth, passkey auth, Alien auth, World ID auth, SIWE/SIWS authentication, or valid server session
+    // serverUserAddress means user has a valid HttpOnly cookie - they're authenticated even if providers haven't reconnected yet
     const isFullyAuthenticated = mounted && (
         isEmailAuthenticated ||
         isPasskeyAuthenticated ||
         isAlienAuthenticated ||
         isWorldIdAuthenticated ||
-        isSiweAuthenticated
+        isSiweAuthenticated ||
+        !!serverUserAddress // User has valid server session (survives app updates)
     );
 
     // Show loading while checking auth state
@@ -377,6 +445,10 @@ export default function Home() {
 
     const handleLogout = async () => {
         console.log("[Logout] Starting logout...");
+        
+        // IMPORTANT: Set flag FIRST to prevent auto-reconnect after reload
+        // This must be done before any disconnect/reload to prevent race conditions
+        sessionStorage.setItem("wallet_intentionally_disconnected", "true");
         
         // Call server logout FIRST to clear HTTP-only session cookie
         try {
@@ -640,12 +712,24 @@ export default function Home() {
 
     // Show dashboard if fully authenticated
     if (isFullyAuthenticated && userAddress) {
+        // IMPORTANT: Determine auth method based on HOW user logged in, not what credentials they have
+        // 1. First check server authMethod (most reliable - survives app updates)
+        // 2. Fall back to client-side detection (for initial login)
+        // - serverAuthMethod = "wallet" → user logged in via wallet signature
+        // - serverAuthMethod = "passkey" → user logged in via passkey
+        // - isSiweAuthenticated = user logged in via wallet signature → "wallet" user
+        // - isPasskeyAuthenticated = user logged in via passkey → "passkey" user
+        // A wallet user with a passkey registered should still be treated as "wallet" user!
+        const isActuallyPasskeyUser = serverAuthMethod 
+            ? serverAuthMethod === "passkey" 
+            : (isPasskeyAuthenticated && !isSiweAuthenticated);
+        
         return (
             <>
                 <PWAInstallPrompt />
                 {/* Show wallet connection status banner for wallet-connected PWA users only */}
                 <WalletConnectionStatus 
-                    isPasskeyUser={isPasskeyAuthenticated}
+                    isPasskeyUser={isActuallyPasskeyUser}
                     isEmailUser={isEmailAuthenticated}
                     isWorldIdUser={isWorldIdAuthenticated}
                     isAlienIdUser={isAlienAuthenticated}
@@ -653,7 +737,7 @@ export default function Home() {
                 <Dashboard
                     userAddress={userAddress}
                     onLogout={handleLogout}
-                    isPasskeyUser={isPasskeyAuthenticated}
+                    isPasskeyUser={isActuallyPasskeyUser}
                     isEmailUser={isEmailAuthenticated}
                     isWorldIdUser={isWorldIdAuthenticated}
                     isAlienIdUser={isAlienAuthenticated}
@@ -869,30 +953,38 @@ export default function Home() {
                         className="text-center text-zinc-600 text-sm mt-6 mb-0 space-y-2"
                     >
                         <div className="flex items-center justify-center gap-4 flex-wrap">
+                            <a
+                                href="https://docs.spritz.chat"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-[#FFBBA7] hover:text-[#FFF0E0] transition-colors"
+                            >
+                                Docs
+                            </a>
+                            <span className="text-zinc-700">•</span>
+                            <a
+                                href="https://docs.spritz.chat/blog"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-[#FFBBA7] hover:text-[#FFF0E0] transition-colors"
+                            >
+                                Blog
+                            </a>
+                            <span className="text-zinc-700">•</span>
                             <Link
                                 href="/privacy"
                                 className="text-[#FFBBA7] hover:text-[#FFF0E0] transition-colors"
                             >
-                                Privacy Policy
+                                Privacy
                             </Link>
                             <span className="text-zinc-700">•</span>
                             <Link
                                 href="/tos"
                                 className="text-[#FFBBA7] hover:text-[#FFF0E0] transition-colors"
                             >
-                                Terms of Service
+                                Terms
                             </Link>
                         </div>
-                        <p>
-                            <a
-                                href="https://walletconnect.com"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-[#FFBBA7] hover:text-[#FFF0E0] transition-colors"
-                            >
-                                WalletConnect
-                            </a>
-                        </p>
                     </motion.div>
                 </motion.div>
             </div>

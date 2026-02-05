@@ -1,10 +1,10 @@
 "use client";
 
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { QRCodeSVG } from "qrcode.react";
 import { type Address } from "viem";
-import { useAccount } from "wagmi";
+import { useAccount, useReconnect } from "wagmi";
 import { useAppKit } from "@reown/appkit/react";
 import { useWalletBalances, formatUsd, formatTokenBalance } from "@/hooks/useWalletBalances";
 import { useSmartWallet } from "@/hooks/useSmartWallet";
@@ -591,18 +591,28 @@ type WalletTabType = "balances" | "send" | "history" | "receive" | "security";
 export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authMethod }: WalletModalProps) {
     // Check if wallet is connected (for sending)
     const { isConnected } = useAccount();
+    const { reconnect, connectors } = useReconnect();
     const { open: openConnectModal } = useAppKit();
+    const [isAutoReconnecting, setIsAutoReconnecting] = useState(false);
+    const autoReconnectAttemptedRef = useRef(false);
+    
+    // IMPORTANT: Default to "wallet" if authMethod is not provided
+    // This ensures EOA users never get passkey prompts
+    const effectiveAuthMethod = authMethod || "wallet";
     
     // Determine if user authenticated via passkey (needs Safe signing)
-    const isPasskeyUser = authMethod === "passkey";
+    const isPasskeyUser = effectiveAuthMethod === "passkey";
     
     // For email/digital_id/world_id/solana users, they should use passkey signing
     // This means we don't store any private keys - passkey is the only signer
     // Solana users need passkey because Solana wallets can't sign EVM transactions
-    const isSolanaUser = authMethod === "solana";
-    const needsPasskeyForSend = authMethod === "email" || authMethod === "alien_id" || authMethod === "world_id" || isSolanaUser;
-    const canUsePasskeySigning = isPasskeyUser || needsPasskeyForSend;
-
+    const isSolanaUser = effectiveAuthMethod === "solana";
+    const needsPasskeyForSend = effectiveAuthMethod === "email" || effectiveAuthMethod === "alien_id" || effectiveAuthMethod === "world_id" || isSolanaUser;
+    
+    // CRITICAL: Only use passkey signing for non-wallet users
+    // Wallet users should NEVER trigger passkey signing - they sign with their connected wallet
+    const canUsePasskeySigning = effectiveAuthMethod !== "wallet" && (isPasskeyUser || needsPasskeyForSend);
+    
     // Get Smart Wallet (Safe) address
     const { smartWallet, isLoading: isSmartWalletLoading } = useSmartWallet(
         isOpen ? userAddress : null
@@ -713,14 +723,101 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
         reset: resetPasskey,
     } = useSafePasskeySend();
 
+    // Reset passkey state when modal opens for WALLET users
+    // This clears any stale passkey errors from previous sessions
+    useEffect(() => {
+        if (isOpen && effectiveAuthMethod === "wallet") {
+            console.log("[WalletModal] Wallet user - resetting passkey state");
+            resetPasskey();
+        }
+    }, [isOpen, effectiveAuthMethod, resetPasskey]);
+
+    // Debug log on mount and when authMethod changes (after all hooks are declared)
+    useEffect(() => {
+        if (isOpen) {
+            console.log("[WalletModal] Auth state:", { 
+                authMethod, 
+                effectiveAuthMethod,
+                isPasskeyUser,
+                canUsePasskeySigning,
+                isConnected,
+                passkeyStatus,
+                userAddress: userAddress?.slice(0, 10),
+            });
+        }
+    }, [isOpen, authMethod, effectiveAuthMethod, isPasskeyUser, canUsePasskeySigning, isConnected, passkeyStatus, userAddress]);
+
     // Initialize passkey Safe when modal opens for users who can use passkey signing
     // This includes: passkey users, email users, alien_id users, world_id users
+    // IMPORTANT: Wallet users (effectiveAuthMethod === "wallet") should NEVER trigger this
     useEffect(() => {
         if (isOpen && canUsePasskeySigning && userAddress && !isPasskeyReady && passkeyStatus === "idle") {
-            console.log("[WalletModal] Initializing passkey Safe for user:", userAddress.slice(0, 10), "authMethod:", authMethod);
+            console.log("[WalletModal] Initializing passkey Safe for user:", userAddress.slice(0, 10), "authMethod:", effectiveAuthMethod);
             initializePasskey(userAddress as Address);
         }
-    }, [isOpen, canUsePasskeySigning, userAddress, isPasskeyReady, passkeyStatus, initializePasskey, authMethod]);
+    }, [isOpen, canUsePasskeySigning, userAddress, isPasskeyReady, passkeyStatus, initializePasskey, effectiveAuthMethod]);
+
+    // Auto-reconnect wallet for PWA users when Send tab is opened
+    // This runs silently in the background - no UI shown
+    useEffect(() => {
+        // Only for wallet users who are disconnected and on Send tab
+        if (!isOpen || activeTab !== "send" || isConnected || effectiveAuthMethod !== "wallet" || canUsePasskeySigning) {
+            return;
+        }
+        
+        // Only attempt once per modal open to avoid spam
+        if (autoReconnectAttemptedRef.current) {
+            return;
+        }
+        
+        // Check if there's a saved session to reconnect
+        const hasSavedSession = (() => {
+            try {
+                const wagmiState = localStorage.getItem("wagmi.store");
+                if (wagmiState) {
+                    const parsed = JSON.parse(wagmiState);
+                    if (parsed?.state?.current || parsed?.state?.connections) {
+                        return true;
+                    }
+                }
+                for (const key of Object.keys(localStorage)) {
+                    if (key.startsWith("wc@") || key.startsWith("@reown") || key.includes("walletconnect")) {
+                        return true;
+                    }
+                }
+            } catch {
+                // Ignore
+            }
+            return false;
+        })();
+        
+        if (!hasSavedSession) {
+            return;
+        }
+        
+        autoReconnectAttemptedRef.current = true;
+        setIsAutoReconnecting(true);
+        console.log("[WalletModal] Auto-reconnecting wallet for PWA user...");
+        
+        // Attempt silent reconnection
+        try {
+            reconnect({ connectors });
+        } catch {
+            // Silently fail - user can manually reconnect
+        }
+        
+        // Give reconnection a few seconds to complete, then hide spinner
+        setTimeout(() => {
+            setIsAutoReconnecting(false);
+        }, 3000);
+    }, [isOpen, activeTab, isConnected, effectiveAuthMethod, canUsePasskeySigning, reconnect, connectors]);
+    
+    // Reset auto-reconnect flag when modal closes
+    useEffect(() => {
+        if (!isOpen) {
+            autoReconnectAttemptedRef.current = false;
+        }
+    }, [isOpen]);
 
     // Onramp (Buy crypto) hook
     const {
@@ -983,7 +1080,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
         if (canUsePasskeySigning) {
             // Send via passkey-signed Safe transaction
             // This works for passkey, email, alien_id, and world_id users
-            console.log("[WalletModal] Sending via passkey Safe to:", resolvedRecipient, "authMethod:", authMethod);
+            console.log("[WalletModal] Sending via passkey Safe to:", resolvedRecipient, "authMethod:", effectiveAuthMethod);
             hash = await sendPasskeyTransaction(
                 resolvedRecipient,
                 actualSendAmount,
@@ -1033,7 +1130,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                 refreshTx();
             }, 15000);
         }
-    }, [sendToken, resolvedRecipient, actualSendAmount, send, sendSafeTransaction, sendPasskeyTransaction, useSafeForSend, safeAddress, canUsePasskeySigning, authMethod, refresh, refreshTx, selectedChainId, useEOAForGas]);
+    }, [sendToken, resolvedRecipient, actualSendAmount, send, sendSafeTransaction, sendPasskeyTransaction, useSafeForSend, safeAddress, canUsePasskeySigning, effectiveAuthMethod, refresh, refreshTx, selectedChainId, useEOAForGas]);
 
     // Reset send form
     const resetSendForm = useCallback(() => {
@@ -1093,6 +1190,16 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
             setHasAcknowledgedChainWarning(false);
         }
     }, [isOpen, resetSendForm]);
+
+    // Lock body scroll when modal is open to prevent scroll bleed
+    useEffect(() => {
+        if (isOpen) {
+            document.body.style.overflow = 'hidden';
+            return () => {
+                document.body.style.overflow = '';
+            };
+        }
+    }, [isOpen]);
 
     // Auto-estimate gas when send form is complete
     useEffect(() => {
@@ -1162,7 +1269,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                             <div className="flex items-center justify-between mb-3">
                                 <div className="flex items-center gap-2">
                                     <span className="text-xl">💳</span>
-                                    <h2 className="text-lg font-semibold text-white">Spritz Wallets</h2>
+                                    <h2 className="text-lg font-semibold text-white">Spritz Wallet</h2>
                                     <span className="text-xs text-yellow-500 bg-yellow-500/10 px-2 py-0.5 rounded-full">
                                         Beta
                                     </span>
@@ -1386,7 +1493,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                         {/* Tab Content */}
                         <div className="flex-1 flex flex-col overflow-hidden border-t border-zinc-800/50">
                             {activeTab === "balances" && (
-                                <div className="flex-1 overflow-y-auto">
+                                <div className="flex-1 overflow-y-auto overscroll-contain">
                                     {/* Chain selector dropdown */}
                                     <ChainSelectorDropdown
                                         selectedChainId={selectedChainId}
@@ -1515,9 +1622,9 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                             )}
 
                             {activeTab === "receive" && (
-                                <div className="relative flex-1 flex flex-col overflow-y-auto">
-                                    {/* Email/Digital ID users without passkey - must create one to unlock wallet */}
-                                    {(smartWallet?.needsPasskey || (needsPasskeyForSend && passkeyStatus === "error")) ? (
+                                <div className="relative flex-1 flex flex-col overflow-y-auto overscroll-contain">
+                                    {/* Email/Digital ID users without passkey AND no existing wallet address - must create one */}
+                                    {((smartWallet?.needsPasskey && !smartWalletAddress) || (needsPasskeyForSend && passkeyStatus === "error" && !smartWalletAddress)) ? (
                                         <div className="flex flex-col items-center justify-center text-center p-6">
                                             <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-purple-500/10 flex items-center justify-center">
                                                 <span className="text-3xl">🔐</span>
@@ -1576,16 +1683,34 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                                         </p>
                                     </div>
 
-                                    {/* Passkey wallet warning - remind users that passkey = wallet key */}
+                                    {/* Passkey wallet warning - different messages for normal vs lost passkey */}
                                     {smartWallet?.warning && needsPasskeyForSend && (
-                                        <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 mb-4 mx-auto max-w-xs">
-                                            <div className="flex items-start gap-2">
-                                                <span className="text-amber-400 text-sm">🔑</span>
-                                                <p className="text-xs text-amber-200/80">
-                                                    <strong>Your passkey controls this wallet.</strong> Keep it safe - losing your passkey means losing access to funds.
-                                                </p>
+                                        smartWallet?.needsPasskey ? (
+                                            // Lost passkey warning - more prominent
+                                            <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-4 mx-auto max-w-xs">
+                                                <div className="flex items-start gap-2">
+                                                    <span className="text-red-400 text-lg">⚠️</span>
+                                                    <div>
+                                                        <p className="text-sm text-red-200 font-semibold mb-1">
+                                                            Passkey Not Found
+                                                        </p>
+                                                        <p className="text-xs text-red-200/80">
+                                                            Your wallet address is shown below, but you cannot send transactions until you restore your passkey. Go to Security settings to re-register your passkey.
+                                                        </p>
+                                                    </div>
+                                                </div>
                                             </div>
-                                        </div>
+                                        ) : (
+                                            // Normal warning
+                                            <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 mb-4 mx-auto max-w-xs">
+                                                <div className="flex items-start gap-2">
+                                                    <span className="text-amber-400 text-sm">🔑</span>
+                                                    <p className="text-xs text-amber-200/80">
+                                                        <strong>Your passkey controls this wallet.</strong> Keep it safe - losing your passkey means losing access to funds.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        )
                                     )}
 
                                     {/* QR Code - uses Smart Wallet address */}
@@ -1698,41 +1823,49 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
 
                             {activeTab === "send" && (
                                 <div className="flex-1 flex flex-col overflow-y-auto relative">
-                                    {/* Loading state */}
-                                    {((canUsePasskeySigning && passkeyStatus === "loading") || isSmartWalletLoading) ? (
+                                    {/* Loading state - includes passkey users initializing */}
+                                    {((canUsePasskeySigning && (passkeyStatus === "loading" || passkeyStatus === "idle")) || isSmartWalletLoading) ? (
                                         <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
                                             <div className="w-12 h-12 border-4 border-purple-500/30 border-t-purple-500 rounded-full animate-spin mb-4" />
                                             <p className="text-sm text-zinc-400">Loading wallet...</p>
                                         </div>
                                     ) : (smartWallet?.needsPasskey || (canUsePasskeySigning && passkeyStatus === "error" && needsPasskeyForSend)) ? (
-                                        /* Email/Digital ID users without a passkey - prompt to create one */
+                                        /* Email/Digital ID users without a passkey - different message if they have an existing wallet */
                                         <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
-                                            <div className="w-16 h-16 rounded-full bg-purple-500/20 flex items-center justify-center mb-4">
-                                                <span className="text-3xl">🔐</span>
+                                            <div className={`w-16 h-16 rounded-full ${smartWalletAddress ? 'bg-red-500/20' : 'bg-purple-500/20'} flex items-center justify-center mb-4`}>
+                                                <span className="text-3xl">{smartWalletAddress ? '⚠️' : '🔐'}</span>
                                             </div>
-                                            <h3 className="text-lg font-semibold text-white mb-2">Create Your Wallet</h3>
+                                            <h3 className="text-lg font-semibold text-white mb-2">
+                                                {smartWalletAddress ? 'Passkey Required' : 'Create Your Wallet'}
+                                            </h3>
                                             <p className="text-sm text-zinc-400 mb-4 max-w-xs">
-                                                {isSolanaUser ? (
+                                                {smartWalletAddress ? (
+                                                    <>Your passkey credentials were not found. Re-register your passkey in Security settings to send transactions.</>
+                                                ) : isSolanaUser ? (
                                                     <>Your Solana wallet can&apos;t sign EVM transactions. Create a passkey to get your EVM wallet.</>
                                                 ) : (
                                                     <>Set up a passkey to create your wallet. Your passkey will be your wallet key - it signs all your transactions.</>
                                                 )}
                                             </p>
-                                            <div className="bg-purple-500/10 border border-purple-500/30 rounded-xl p-4 mb-6 max-w-xs">
-                                                <p className="text-xs text-purple-300">
+                                            <div className={`${smartWalletAddress ? 'bg-red-500/10 border-red-500/30' : 'bg-purple-500/10 border-purple-500/30'} border rounded-xl p-4 mb-6 max-w-xs`}>
+                                                <p className={`text-xs ${smartWalletAddress ? 'text-red-300' : 'text-purple-300'}`}>
                                                     <strong>🔑 Your Passkey = Your Wallet Key</strong>
                                                     <br />
-                                                    <span className="text-zinc-400">Keep it safe - losing it means losing wallet access.</span>
+                                                    <span className="text-zinc-400">
+                                                        {smartWalletAddress 
+                                                            ? 'Go to Security settings to restore or re-register your passkey.' 
+                                                            : 'Keep it safe - losing it means losing wallet access.'}
+                                                    </span>
                                                 </p>
                                             </div>
                                             <button
                                                 onClick={() => setShowPasskeyManager(true)}
-                                                className="px-6 py-3 bg-purple-500 hover:bg-purple-600 text-white font-medium rounded-xl transition-colors"
+                                                className={`px-6 py-3 ${smartWalletAddress ? 'bg-red-500 hover:bg-red-600' : 'bg-purple-500 hover:bg-purple-600'} text-white font-medium rounded-xl transition-colors`}
                                             >
-                                                Create Passkey & Wallet
+                                                {smartWalletAddress ? 'Restore Passkey' : 'Create Passkey & Wallet'}
                                             </button>
                                             <p className="text-xs text-zinc-600 mt-4">
-                                                🔒 Your passkey stays on your device
+                                                🔒 {smartWalletAddress ? 'Re-register the same passkey to regain access' : 'Your passkey stays on your device'}
                                             </p>
                                         </div>
                                     ) : canUsePasskeySigning && passkeyStatus === "error" ? (
@@ -1786,34 +1919,47 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                                                 </>
                                             )}
                                         </div>
-                                    ) : !isConnected && !canUsePasskeySigning ? (
+                                    ) : !isConnected && effectiveAuthMethod === "wallet" && !canUsePasskeySigning ? (
+                                        // Only show "Reconnect to Send" for wallet users who need wallet connection
+                                        // Passkey/email/digital_id users don't need wallet connection
                                         <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
-                                            <div className="w-16 h-16 rounded-full bg-purple-500/20 flex items-center justify-center mb-4">
-                                                <svg className="w-8 h-8 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                                                </svg>
-                                            </div>
-                                            <h3 className="text-lg font-semibold text-white mb-2">Reconnect to Send</h3>
-                                            <p className="text-sm text-zinc-400 mb-4 max-w-xs">
-                                                Your wallet session expired. Reconnect to sign transactions.
-                                            </p>
-                                            <button
-                                                onClick={() => openConnectModal?.()}
-                                                className="w-full max-w-[200px] px-6 py-3 bg-purple-500 hover:bg-purple-600 text-white font-medium rounded-xl transition-colors"
-                                            >
-                                                Reconnect Wallet
-                                            </button>
-                                            <div className="mt-6 pt-4 border-t border-zinc-800 w-full max-w-xs">
-                                                <p className="text-xs text-zinc-500 mb-3">
-                                                    💡 Set up a passkey to send without reconnecting
-                                                </p>
-                                                <button
-                                                    onClick={() => setActiveTab("security")}
-                                                    className="text-xs text-purple-400 hover:text-purple-300 font-medium"
-                                                >
-                                                    Go to Security →
-                                                </button>
-                                            </div>
+                                            {isAutoReconnecting ? (
+                                                // Auto-reconnecting state - show spinner
+                                                <>
+                                                    <div className="w-12 h-12 border-4 border-purple-500/30 border-t-purple-500 rounded-full animate-spin mb-4" />
+                                                    <p className="text-sm text-zinc-400">Reconnecting wallet...</p>
+                                                </>
+                                            ) : (
+                                                // Disconnected state - show reconnect options
+                                                <>
+                                                    <div className="w-16 h-16 rounded-full bg-purple-500/20 flex items-center justify-center mb-4">
+                                                        <svg className="w-8 h-8 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                                                        </svg>
+                                                    </div>
+                                                    <h3 className="text-lg font-semibold text-white mb-2">Wallet Disconnected</h3>
+                                                    <p className="text-sm text-zinc-400 mb-4 max-w-xs">
+                                                        Your wallet session expired. This commonly happens on mobile PWA apps.
+                                                    </p>
+                                                    <button
+                                                        onClick={() => openConnectModal?.()}
+                                                        className="w-full max-w-[200px] px-6 py-3 bg-purple-500 hover:bg-purple-600 text-white font-medium rounded-xl transition-colors"
+                                                    >
+                                                        Reconnect Wallet
+                                                    </button>
+                                                    <div className="mt-6 pt-4 border-t border-zinc-800 w-full max-w-xs">
+                                                        <p className="text-xs text-zinc-500 mb-3">
+                                                            💡 <strong>Tip for PWA users:</strong> Set up a passkey to send without needing wallet reconnection
+                                                        </p>
+                                                        <button
+                                                            onClick={() => setActiveTab("security")}
+                                                            className="text-xs text-purple-400 hover:text-purple-300 font-medium"
+                                                        >
+                                                            Go to Security →
+                                                        </button>
+                                                    </div>
+                                                </>
+                                            )}
                                         </div>
                                     ) : (
                                     <>
@@ -1837,7 +1983,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                                                         </svg>
                                                     </button>
                                                 </div>
-                                                <div className="flex-1 overflow-y-auto">
+                                                <div className="flex-1 overflow-y-auto overscroll-contain">
                                                     {allTokens.length === 0 ? (
                                                         <div className="p-8 text-center text-zinc-500 text-sm">
                                                             No tokens with balance
@@ -2068,7 +2214,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                                             
                                             {/* Suggestions dropdown */}
                                             {showRecipientSuggestions && !showSaveAddressDialog && (filteredSuggestions.length > 0 || canSaveToAddressBook) && (
-                                                <div className="absolute z-50 w-full mt-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl max-h-64 overflow-y-auto">
+                                                <div className="absolute z-50 w-full mt-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl max-h-64 overflow-y-auto overscroll-contain">
                                                     {/* Save to address book option */}
                                                     {canSaveToAddressBook && (
                                                         <button
@@ -2407,7 +2553,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                             )}
 
                             {activeTab === "history" && (
-                                <div className="flex-1 flex flex-col overflow-y-auto">
+                                <div className="flex-1 flex flex-col overflow-y-auto overscroll-contain">
                                     {/* Header with refresh */}
                                     <div className="px-4 py-2 flex items-center justify-between border-b border-zinc-800/50">
                                         <span className="text-xs text-zinc-500">
@@ -2429,7 +2575,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                                     </div>
 
                                     {/* Transaction list */}
-                                    <div className="flex-1 overflow-y-auto">
+                                    <div className="flex-1 overflow-y-auto overscroll-contain">
                                         {isLoadingTx && transactions.length === 0 ? (
                                             <div className="p-8 flex flex-col items-center gap-3">
                                                 <div className="w-8 h-8 border-2 border-zinc-700 border-t-cyan-500 rounded-full animate-spin" />
@@ -2488,7 +2634,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                             )}
 
                             {activeTab === "security" && (
-                                <div className="flex-1 p-4 space-y-4 overflow-y-auto">
+                                <div className="flex-1 p-4 space-y-4 overflow-y-auto overscroll-contain">
                                     {/* Multi-Chain Security - shows Safe status across all chains */}
                                     {smartWallet?.smartWalletAddress && (
                                         <MultiChainSecurity
@@ -2642,7 +2788,7 @@ export function WalletModal({ isOpen, onClose, userAddress, emailVerified, authM
                                 </div>
                                 
                                 {/* Vaults List */}
-                                <div className="flex-1 p-4 overflow-y-auto">
+                                <div className="flex-1 p-4 overflow-y-auto overscroll-contain">
                                     <VaultList
                                         userAddress={userAddress}
                                         onCreateNew={() => setShowCreateVaultModal(true)}

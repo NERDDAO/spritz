@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import type { ChatKgContext } from "@/lib/delve/chatContext";
 
 export type MCPServer = {
     id: string;
@@ -45,6 +46,7 @@ export type Agent = {
     mcp_enabled: boolean;
     api_enabled: boolean;
     scheduling_enabled?: boolean;
+    events_access?: boolean;
     message_count: number;
     created_at: string;
     updated_at: string;
@@ -60,6 +62,10 @@ export type Agent = {
     x402_pricing_mode?: "global" | "per_tool";
     // MCP server configuration
     mcp_servers?: MCPServer[];
+    // Suggested questions for public page (Official agents can customize)
+    suggested_questions?: string[];
+    // Public access control for Official agents
+    public_access_enabled?: boolean;
     // API Tools configuration
     api_tools?: APITool[];
 };
@@ -88,6 +94,18 @@ export type ChatMessage = {
     content: string;
     created_at: string;
     scheduling?: SchedulingData;
+    kg_context?: ChatKgContext;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+
+const parseChatKgContext = (value: unknown): ChatKgContext | undefined => {
+    if (!isRecord(value)) return undefined;
+    if (!Array.isArray(value.entities) || !Array.isArray(value.relationships)) {
+        return undefined;
+    }
+    return value as ChatKgContext;
 };
 
 export function useAgents(userAddress: string | null, isAdmin: boolean = false) {
@@ -175,14 +193,18 @@ export function useAgents(userAddress: string | null, isAdmin: boolean = false) 
         updates: {
             name?: string;
             personality?: string;
+            systemInstructions?: string;
             avatarEmoji?: string;
             avatarUrl?: string | null;
             visibility?: "private" | "friends" | "public" | "official";
             tags?: string[];
+            suggestedQuestions?: string[];
             webSearchEnabled?: boolean;
             useKnowledgeBase?: boolean;
             mcpEnabled?: boolean;
             apiEnabled?: boolean;
+            schedulingEnabled?: boolean;
+            publicAccessEnabled?: boolean;
             x402Enabled?: boolean;
             x402PriceCents?: number;
             x402Network?: "base" | "base-sepolia";
@@ -320,19 +342,27 @@ export function useAgentChat(userAddress: string | null, agentId: string | null)
                 body: JSON.stringify({ userAddress, message }),
             });
 
-            const data = await res.json();
+            const data: unknown = await res.json();
 
             if (!res.ok) {
-                throw new Error(data.error || "Failed to send message");
+                if (isRecord(data) && typeof data.error === "string") {
+                    throw new Error(data.error);
+                }
+                throw new Error("Failed to send message");
             }
+
+            const kgContext = parseChatKgContext(
+                isRecord(data) ? data.kg_context : undefined
+            );
 
             // Add assistant response with optional scheduling data
             const assistantMessage: ChatMessage = {
                 id: `resp-${Date.now()}`,
                 role: "assistant",
-                content: data.message,
+                content: isRecord(data) && typeof data.message === "string" ? data.message : "",
                 created_at: new Date().toISOString(),
-                scheduling: data.scheduling || undefined,
+                scheduling: isRecord(data) ? (data.scheduling as SchedulingData | undefined) : undefined,
+                kg_context: kgContext,
             };
             setMessages(prev => [...prev, assistantMessage]);
 
